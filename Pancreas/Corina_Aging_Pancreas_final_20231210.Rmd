@@ -1,0 +1,739 @@
+---
+title: "scRNA - Seurat - uPAR Aging scRNA - PDAC"
+author: "Ray"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: html_document
+params:
+    workdir: "./"
+    prefix: "Corina_Aging_PDAC_final"
+    dat.path: "/Users/hoy/Copy/MSKCC/Corina/Aging/GitHub/Pancreas"
+    sample.file: "/Users/hoy/Copy/MSKCC/Corina/Aging/GitHub/Pancreas/SampleID.csv"
+    geneset.file: "/Users/hoy/Copy/MSKCC/Corina/Aging/GitHub/Pancreas/PDAC_signatures.xlsx"
+    geneset.sheet: "PDAC_Mouse"
+---
+
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(Seurat)
+library(SeuratData)
+library(SeuratDisk)
+library(SeuratWrappers)
+library(RColorBrewer)
+library(Matrix)
+library(cowplot)
+library(patchwork)
+
+library(future) # multicore
+plan("multisession", workers = 12)
+options(future.globals.maxSize = 8000 * 1024^2)
+
+folder <- params$workdir
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = folder)
+setwd(folder)
+source("~/Copy/MSKCC/Rscripts/helper.R")
+
+prefix <- params$prefix
+```
+
+
+
+### Start everything from loading 10X data
+# https://github.com/satijalab/seurat/issues/4096
+```{r read_raw}
+my_Read10X_h5 <- function(path, name){
+  mat <- Seurat::Read10X_h5(path)
+  colnames(mat) = paste(name, gsub("-1", "", colnames(mat)), sep="_")
+  return(mat)
+}
+
+mat <- Seurat::Read10X_h5("/Users/hoy/Copy/MSKCC/Corina/Aging/GitHub/Pancreas/Pancreas_filtered_feature_bc_matrix.h5")
+
+res <- list.files(path = params$dat.path, pattern = "feature_bc_matrix.h5$",
+                  recursive = TRUE, full.names = TRUE) %>%
+  tibble(filename = .) %>%
+  mutate(ID = gsub(".*integrate_pdac_dp\\/", "", filename) %>% gsub("\\/raw_feature.*", "", .)) %>%
+  mutate(seurat_obj = pmap(list(filename, ID), my_Read10X_h5))
+
+exp.mat <- NULL
+for(i in 1:length(res$seurat_obj)){
+  exp.mat <- cbind(res$seurat_obj[[i]], exp.mat)
+}
+colnames(exp.mat) <- gsub("filtered_feature_bc_matrix.h5_", "", basename(colnames(exp.mat))) %>%
+  ifelse(grepl("-", .), ., paste0(., "-1"))
+
+# Read in the expression matrix The first row is a header row, the first column is rownames
+meta <- read_csv(params$sample.file) %>%
+  separate(SampleID, into = c("tmp1", "tmp2", "tmp3", "tmp4", "tmp5"), sep="_") %>%
+  dplyr::rename(Sex = tmp3) %>%
+  unite(uPAR, tmp4, tmp5) %>%
+  mutate(Group = paste(Sex, uPAR, sep="_")) %>%
+  mutate(Type = as.factor(Group) %>% as.numeric() %>% paste0("PDAC", .)) %>%
+  mutate(SampleID = paste("Amor", Type, Sex, uPAR, sep="_"), .after = Barcode) %>%
+  dplyr::select(-contains("tmp")) %>%
+  convert_tibble_to_dataframe()
+
+pbmc <- CreateSeuratObject(counts = exp.mat, project = "Aging",
+                           min.cells = 10, 
+                           meta.data = meta)
+pbmc <- PercentageFeatureSet(pbmc, pattern = "^mt-", col.name = "percent.mt")
+
+# nFeature_RNA = genes
+# nCount_RNA = UMI
+# remove cells containing less than 500 identified genes, or more than 15% of reads from mitochondria
+pbmc <- subset(pbmc, subset = nFeature_RNA > 500 &
+                              nCount_RNA > 2500 & nCount_RNA < 90000 &
+                              percent.mt < 15)
+```
+
+
+
+### Use rawdata + SCTransform + BBKNN
+
+```{r bbknn_rawdata}
+library(bbknnR)
+
+DefaultAssay(pbmc) <- "RNA"
+pbmc <- NormalizeData(pbmc)
+s.genes <- tibble(Gene = cc.genes$s.genes) %>% convert_human_to_mouse() %>% distinct() %>% pull(Gene)
+g2m.genes <- tibble(Gene = cc.genes$g2m.genes) %>% convert_human_to_mouse() %>% distinct() %>% pull(Gene)
+pbmc <- CellCycleScoring(pbmc, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+pbmc$CC.Difference <- pbmc$S.Score - pbmc$G2M.Score
+
+# run sctransform
+DefaultAssay(pbmc) <- "RNA"
+pbmc <- SCTransform(pbmc, vars.to.regress = "percent.mt", method = "glmGamPoi", verbose = FALSE)
+pbmc <- RunPCA(pbmc)
+pbmc <- RunBBKNN(pbmc, batch_key = "SampleID")
+pbmc <- FindNeighbors(pbmc, dims = 1:30, verbose = FALSE, reduction = "pca")
+pbmc <- FindClusters(pbmc, verbose = FALSE, resolution = 0.9, cluster.name = "bbknn_clusters")
+# save 
+qs::qsave(pbmc, paste0(prefix, ".rawdata.SCTransform.BBKNN.qs"))
+
+
+my.color <- c("#214FAB", "#FF2A2A")
+p0 <- DimPlot(pbmc, reduction = "umap", 
+              group.by = "uPAR", 
+              cols = my.color, pt.size = 0.5,
+              label = FALSE, label.size = 5) + 
+  theme(axis.title = element_text(size = 14),
+        plot.title = element_text(size = 20))
+pdf(paste0(prefix, ".rawdata.SCTransform.BBKNN.uPAR.pdf"), width=11, height=10)
+  print(p0)
+dev.off()
+
+p <- DimPlot(pbmc, reduction = "umap", 
+                group.by = c("SampleID", "Type", "uPAR", 
+                          "Phase", "bbknn_clusters", "Sex"),
+             label = TRUE, label.size = 5,
+             ncol = 3) + NoLegend() &
+  theme(axis.title = element_text(size = 14),
+        plot.title = element_text(size = 20))
+p1 <- DimPlot(pbmc, reduction = "umap", 
+                group.by = c("SampleID", "bbknn_clusters"),
+             label = TRUE, label.size = 5,
+             ncol = 2) + NoLegend() &
+  theme(axis.title = element_text(size = 14),
+        plot.title = element_text(size = 20))
+
+pdf(paste0(prefix, ".rawdata.SCTransform.BBKNN.pdf"), width=25, height=15)
+  print(p)
+  print(p1)
+dev.off()
+
+p <- FeaturePlot(pbmc, 
+                features = c("Plaur", "Cdkn1a", "Trp53", 
+                             "percent.mt", "nFeature_RNA", "nCount_RNA"),
+                 label = FALSE, 
+                 label.size = 9, 
+                 order = FALSE,
+                 pt.size = 1.3,
+                 min.cutoff = "q5", 
+                 max.cutoff = "q95", 
+                 ncol = 3,
+                 combine = T) &
+  theme(axis.title = element_text(size = 14),
+        plot.title = element_text(size = 28)) &
+  scale_colour_gradientn(colours = rev(brewer.pal(n = 11, name = "RdBu")))
+
+pdf(paste0(prefix, ".ModuleScore_FeaturPlot.rawdata.SCTransform.BBKNN.pdf"), width=28, height=18)
+  print(p)
+dev.off()
+```
+
+
+
+## Annotating cell types using SingleR
+```{r message=FALSE, warning=FALSE}
+DefaultAssay(pbmc) <- "RNA"
+
+# SingleR for cell-type annotation
+library(SingleR)
+# mouse immune data 
+immgen.se <- celldex::ImmGenData()
+pred.main <- SingleR(test = as.SingleCellExperiment(DietSeurat(pbmc), assay = "RNA"),
+                     ref = immgen.se, 
+                     assay.type.test = "logcounts",
+                     assay.type.ref = "logcounts",
+                     labels = immgen.se$label.main, num.threads = 10)
+pbmc$singlr_Immune_main <- pred.main$labels
+# another mouse data 
+mouse.se <- celldex::MouseRNAseqData()
+pred.main <- SingleR(test = as.SingleCellExperiment(DietSeurat(pbmc), assay = "RNA"),
+                     ref = mouse.se, 
+                     assay.type.test = "logcounts",
+                     assay.type.ref = "logcounts",
+                     labels = mouse.se$label.main, num.threads = 10)
+pbmc$singlr_Mouse_main <- pred.main$labels
+
+# SingleR ver2 from scRNA reference
+library(SingleR)
+library(scRNAseq)
+out <- listDatasets()
+pdac_ref <- BaronPancreasData("mouse")
+head(pdac_ref@colData)
+
+pdac_ref <- pdac_ref[, !is.na(pdac_ref$label)]
+library(scuttle)
+pdac_ref <- logNormCounts(pdac_ref)
+results <- SingleR(test = as.SingleCellExperiment(DietSeurat(pbmc), assay = "RNA"),
+                   ref = pdac_ref,
+                   assay.type.test = "logcounts",
+                   assay.type.ref = "logcounts",
+                   labels = pdac_ref$label, num.threads = 10)
+pbmc$singlr_BaronPanc <- results$labels
+
+
+### 
+p1 <- DimPlot(pbmc, reduction = "umap", 
+              group.by = c("SampleID", 
+                           "bbknn_clusters", 
+                           "uPAR",
+                           "singlr_Immune_main", 
+                           "singlr_Mouse_main", 
+                           "singlr_BaronPanc"),
+              label = TRUE, label.size = 3.5, pt.size = 0.7, 
+              ncol = 3) &
+  theme(axis.title = element_text(size = 14),
+        plot.title = element_text(size = 24)) &
+  guides(color=guide_legend(ncol =1, override.aes = list(size=3)))
+
+pdf(paste0(prefix, ".singlR.annotation.pdf"), width=20, height=11)
+  print(p1)
+dev.off()
+
+qs::qsave(pbmc, paste0(prefix, ".rawdata.SCTransform.BBKNN.singlr.qs"))
+```
+
+
+
+### Calculate ModuleScore to idenfity and filter out Non-Tumor cells
+- calculate [avg modulescore](https://github.com/satijalab/seurat/issues/1695)
+- Keep only avg.cluster.modulescore of ??
+
+```{r module_score, message=FALSE}
+pbmc <- qs::qread(paste0(prefix, ".rawdata.SCTransform.BBKNN.singlr.qs"))
+pdac_features <- readxl::read_excel(params$geneset.file, sheet = params$geneset.sheet) 
+
+pbmc <- AddModuleScore(object = pbmc,
+                       features = pdac_features,
+                       nbin = 22,
+                       ctrl = 100,
+                       name = 'PDAC') %>% 
+  replace_ModuleScore_feature_name_v2(., pdac_features, name = "PDAC")
+
+### another version of random shuffle cell order
+my.genes <- c("Plaur", "Mki67", "Trp53")
+p <- FeaturePlot(pbmc, 
+                 features = c(my.genes, names(pdac_features)),
+                 order = FALSE,
+                 pt.size = 0.3,
+                 min.cutoff = "q5", 
+                 max.cutoff = "q95", 
+                 ncol = 6,
+                 combine = T) &
+  theme(axis.title = element_text(size = 14),
+        plot.title = element_text(size = 20)) &
+  scale_colour_gradientn(colours = rev(brewer.pal(n = 11, name = "RdBu")))
+
+pdf(paste(prefix, params$geneset.sheet, "ModuleScore_FeaturPlot.pdf", sep="."), width=28, height=24)
+  print(p)
+dev.off()
+
+### avg.ModuleScore
+ModuleScore <- pbmc@meta.data[, names(pdac_features)]
+mean_sig_clusters <- list() # define empty obj
+
+for (ident in  levels(pbmc@active.ident)) {
+  mean_sig_clusters[[ident]] <- colMeans(ModuleScore[which(colnames(pbmc) %in% WhichCells(pbmc, ident=ident)), ]) %>% 
+    convert_data_to_tibble(name = "Group") %>% 
+    dplyr::rename(value = x) %>%
+    mutate(Ident = ident)
+}
+mean_sig_clusters <- purrr::reduce(mean_sig_clusters, bind_rows) 
+
+### heat map version
+library(wesanderson)
+x2 <- mean_sig_clusters %>% 
+  spread(Group, value) %>%
+  mutate(Ident = as.numeric(Ident)) %>%
+  arrange(Ident) %>%
+  convert_tibble_to_dataframe()
+
+# parameters for ploting heatmap
+max.range <- abs(range(x2)) %>% max %>% ceiling 
+max.range <- min(max.range, 3.5)
+breaksList = seq(-max.range, max.range, by = 0.1)
+# color = colorRampPalette(rev(brewer.pal(n = 11, name="RdBu")))(length(breaksList))
+color <- rev(wes_palette("BottleRocket2", length(breaksList), type = "continuous"))
+fontsize_row <- pheatmap_fontsize_row(x2)
+fontsize_col <- pheatmap_fontsize_col(x2)
+pdf_height <- pheatmap_pdf_height(x2)
+pdf_width <- pheatmap_pdf_width(x2)
+          
+pdf(paste(prefix, params$geneset.sheet, "avgModuleScore.heatmap.pdf", sep="."), 
+    height = pdf_height, width = pdf_width)
+pheatmap::pheatmap(x2, color=color,
+                   breaks = breaksList,
+                   clustering_method = "ward.D2", 
+                   clustering_distance_col = "correlation",
+                   clustering_distance_row = "euclidean",
+                   scale = "none", 
+                   cluster_rows = FALSE,
+                   cluster_cols = TRUE,
+                   show_rownames = TRUE, 
+                   gaps_col = gaps_col,
+                   fontsize_row = fontsize_row,
+                   fontsize_col = fontsize_col,
+                   border_color = "gray82",
+                   main = paste("AvgModuleScore:", params$geneset.sheet)
+)
+dev.off()
+```
+
+
+  
+### Rename these indents for each cluster
+
+```{r reident}
+pbmc@meta.data$orig.ident <- pbmc@meta.data$seurat_clusters
+
+cell.type <- tibble(ident = pbmc@meta.data$seurat_clusters) %>%
+  mutate(Group = case_when(ident == 0 ~ "Bcell",
+                           ident == 1 ~ "Bcell",
+                           ident == 2 ~ "Bcell",
+                           ident == 3 ~ "Macrophage",
+                           ident == 4 ~ "Bcell",
+                           ident == 5 ~ "Plasma",
+                           ident == 6 ~ "Tcell",
+                           ident == 7 ~ "Monocyte",
+                           ident == 8 ~ "Tcell",
+                           ident == 9 ~ "Tcell",
+                           ident == 10 ~ "Tcell",
+                           ident == 11 ~ "Endothelial",
+                           ident == 12 ~ "Macrophage",
+                           ident == 13 ~ "DC",
+                           ident == 14 ~ "Tcell",
+                           ident == 15 ~ "Macrophage",
+                           ident == 16 ~ "NK",
+                           ident == 17 ~ "Bcell",
+                           ident == 18 ~ "Fibroblast",
+                           ident == 19 ~ "Tcell",
+                           ident == 20 ~ "Dividing",
+                           ident == 21 ~ "Tcell",
+                           ident == 22 ~ "Tcell",
+                           ident == 23 ~ "DC",
+                           ident == 24 ~ "Epithelial",
+                           ident == 25 ~ "DC",
+                           ident == 26 ~ "Tcell",
+                           ident == 27 ~ "Dividing",
+                           ident == 28 ~ "Epithelial",
+                           ident == 29 ~ "pDC",
+                           ident == 30 ~ "Bcell",
+                           TRUE ~ "Unknown"
+                           ))
+
+pbmc <- SetIdent(pbmc, value = cell.type$Group)
+pbmc@meta.data$Cell_type = pbmc@active.ident
+qs::qsave(pbmc, paste0(prefix, ".pbmc.ReIdent.qs"))
+
+p <- DimPlot(pbmc, group.by = c("Cell_type", "SampleID", "uPAR", "Phase"), 
+              label = TRUE, label.size = 6, pt.size = 0.7) 
+pdf(paste0(prefix, ".ReIdent.pdf"), height=16, width=20)
+  print(p)
+dev.off()
+```
+
+
+### use genes found from [CellMarker](http://bio-bigdata.hrbmu.edu.cn/CellMarker/CellMarkerSearch.jsp?index_species=Mouse&index_tissue=Liver&index_cellname=Hepatocyte&index_key=1#cloud_word)
+
+```{r cellmarker}
+pbmc <- qs::qread(paste0(prefix, ".pbmc.ReIdent.qs"))
+
+paper.features <- c("Pecam1", "Cdh5", 
+                    "Dcn", "Igfbp4", "Lama2", "Col6a1",  # Fibroblast
+                    "Epcam", "Krt8", "Krt18", "Cldn3", # Ductal
+                    "Cd3d", "Il7r", "Cd3e", # Tcell
+                    "Nkg7", "Ncr1", "Klrb1b", # NK
+                    "Lst1", "Csf3r", "Il1b",  # Monocyte
+                    "Adgre1", "C1qa", "C1qb", # Macrophage
+                    "Zbtb46", "Flt3", "Clec10a",  # DC
+                    "Siglech", "Ccr9", "Ly6c2",   # pDC 
+                    "Mki67", "Birc5", "Top2a", "Ube2c", # Cycling
+                    "Cd19", "Ms4a1", "Blk", "Cd22", "Bank1", # Bcell
+                    "Jchain", "Derl3", "Fkbp11") 
+paper.celltype <- c("Endothelial", 
+                    "Fibroblast", "Epithelial",
+                    "Tcell", "NK",
+                    "Monocyte", 
+                    "Macrophage",
+                    "DC", 
+                    "pDC",
+                    "Dividing", 
+                    "Bcell", "Plasma")
+
+pbmc$Cell_type <- factor(pbmc$Cell_type, levels = rev(paper.celltype))
+
+p <- DotPlot(pbmc, features = paper.features, group.by = "Cell_type",
+             cols = c("Reds"), dot.scale = 9) + 
+  RotatedAxis() + 
+  xlab("") +
+  ylab("") +
+  scale_colour_gradient2(low = "gray90", mid = "#FB8072", high = "#E41A1C") +
+  scale_x_discrete(position = "top") +
+  theme(axis.line = element_blank(),
+        axis.text.x.top = element_text(size = 16, vjust = 0, hjust = 0),
+        axis.text.y = element_text(size = 16), 
+        panel.border = element_rect(color = "black", size = 1))
+
+pdf(paste0(prefix, ".NewCelltype.Paper_dotplot.pdf"), width=15.5, height=7)
+  print(p)
+dev.off()
+```
+
+
+
+### PLOT - uPAR distribution for each sample (N=2) separated
+
+```{r upar_dist}
+library(ggpubr)
+pbmc <- qs::qread(paste0(prefix, ".pbmc.ReIdent.qs"))
+
+res <- pbmc@meta.data %>%
+  group_by(Cell_type, SampleID) %>%
+  summarise(n = n()) %>%
+  group_by(SampleID) %>%
+  mutate(pct = n / sum(n)) %>%
+  left_join(., pbmc@meta.data %>% dplyr::distinct(SampleID, uPAR)) %>%
+  dplyr::select(Cell_type, SampleID, pct, uPAR) %>%
+  group_by(Cell_type, uPAR) %>%
+  mutate(mean = mean(pct),
+         sd = sd(pct),
+         sem = plotrix::std.error(pct))
+
+width <- 0.8
+pd <- position_dodge()
+
+p <- res %>% 
+  ggplot(aes(x = Cell_type, y = mean, fill = uPAR)) +
+  geom_bar(stat = "identity", color = "gray20", size = 0.3, width = width, position=pd) + 
+  geom_point(aes(x = Cell_type, y = pct), position = position_dodge(width = width), 
+             alpha = 0.5, size = 1.5)  +
+  geom_errorbar(aes(ymin = mean-sem, ymax = mean+sem), 
+                size = 0.2, 
+                width = width, colour = "black", alpha = 0.9,
+                position = pd) +
+  geom_errorbarh(aes(x = Cell_type,
+                     xmin = (Cell_type - 0.1),
+                     xmax = (Cell_type + 0.1)),
+                 size = 0.3) +
+  scale_fill_manual(values = c("uPAR_plus" = "#FF2A2A", "uPAR_neg" = "#0072B2")) +
+  ggthemes::theme_base() +
+  xlab("") +
+  ylab("Porportion of Cells") +
+  scale_y_continuous(limits = c(0, 0.9), expand = expansion(mult = c(0, -.1))) +
+  theme(panel.grid.minor = element_blank(),
+        axis.text.x = element_text(size = 16, angle = 45, hjust = 1),
+        axis.text.y = element_text(size = 14, face = "bold"),
+        strip.text = element_text(size = 18)) + 
+  stat_compare_means(aes(group = uPAR), method = "t.test", label.y.npc = 0.8, label = "p.format")
+
+pdf(paste(prefix, "uPAR_boxplot_SEM.pdf", sep="."), height=6, width=10)
+  print(p)
+dev.off()
+```
+
+
+
+
+
+
+### Plot2 - Combine Proportion + Senescence score ###
+- use 0.1 as cutoff for Senescence score (Senescence_High, Senescence_Low)
+- filter for Senescence_High cells first
+- then quantify for uPAR_plus/uPAR_neg cells within each Cell_type 
+
+```{r plot2}
+pbmc <- qs::qread(paste0(prefix, ".pbmc.ReIdent.qs"))
+geneset.file <- "/Users/hoy/Copy/MSKCC/Corina/Aging/GitHub/Pancreas/Senescence_and_SASP_genesets_2022_mouse.xlsx"
+geneset.sheet <- "Senescence_survelliance"
+
+sene_features <- readxl::read_excel(geneset.file, sheet = geneset.sheet)
+
+pbmc <- AddModuleScore(object = pbmc,
+                       features = sene_features,
+                       nbin = 22,
+                       ctrl = 100,
+                       name = 'PDAC') %>%
+  replace_ModuleScore_feature_name_v2(., sene_features, name = "PDAC")
+
+### combine starts
+score.cutoff <- 0.05
+
+paper.celltype <- c("Endothelial", 
+                    "Fibroblast", "Epithelial",
+                    "Tcell", "NK",
+                    "Monocyte", 
+                    "Macrophage",
+                    "DC", 
+                    "pDC",
+                    "Dividing", 
+                    "Bcell", "Plasma")
+
+res <- pbmc@meta.data %>%
+  convert_data_to_tibble(name = "ID") %>%
+  dplyr::select(ID, uPAR, Cell_type:last_col()) %>%
+  gather(Senescence, score, -ID, -uPAR, -Cell_type) %>%
+  mutate(Group = ifelse(score >= score.cutoff, "Sene_High", "Sene_Low")) %>%
+  filter(Group == "Sene_High") %>%
+  group_by(Senescence) %>%
+  dplyr::count(uPAR, Cell_type, Group) %>%
+  group_by(Senescence, Cell_type) %>%
+  mutate(pct = n / sum(n) * 100) %>%
+  mutate(Cell_type = factor(Cell_type, levels = rev(paper.celltype))) %>%
+  mutate(uPAR_Sene = paste(uPAR, Group, sep="_"))
+
+
+p <- res %>% 
+  ggplot(aes(x = Cell_type, y = pct, fill = uPAR_Sene)) + 
+  geom_bar(stat = "identity", color = "gray20", size = 0.3) +
+  geom_text(aes(label = signif(pct, 2)), position = position_stack(vjust = 0.5), size = 4) +
+  scale_fill_manual(values = c("uPAR_neg_Sene_High" = "#477FE4", 
+                               "uPAR_plus_Sene_High" = "#e11444")) +
+  theme_bw() +
+  coord_flip() +
+  facet_wrap(~ Senescence, nrow = 3, scales = "free_y") + 
+  xlab("") +
+  ylab("Porportion of Cells") +
+  theme(panel.grid.minor = element_blank(),
+        axis.text.x = element_text(size = 14),
+        axis.text.y = element_text(size = 14),
+        strip.text = element_text(size = 18))
+
+pdf(paste0(prefix, ".SenescenceHigh_Celltype_Proportion2.pdf"), width=33, height=15)
+  print(p)
+dev.off()
+```
+
+
+
+
+### DEG analysis
+- Overall uPAR_high vs. uPAR_low
+
+```{r deg}
+pbmc <- qs::qread(paste0(prefix, ".pbmc.ReIdent.qs"))
+Idents(pbmc) <- "uPAR"
+
+deg.res.raw <- list()
+deg.res <- list()
+cur.treatment <- RunPresto(pbmc, assay = "RNA",
+                           ident.1 = "uPAR_plus",
+                           ident.2 = "uPAR_neg",  
+                           verbose = TRUE) %>%
+  convert_data_to_tibble(name = "Gene") %>%
+  mutate(Group = ifelse(avg_log2FC > 0, "UP", "DN")) %>%
+  mutate(Group = factor(Group, levels = c("UP", "DN"))) %>%
+  arrange(Group, desc(avg_log2FC))
+
+deg.res.raw <- cur.treatment
+deg.res <- cur.treatment %>% 
+  filter(abs(avg_log2FC) > 0.5849625 & p_val_adj < 0.1) 
+
+my.genes <- deg.res %>%
+  group_by(Group) %>%
+  arrange(desc(abs(avg_log2FC))) %>%
+  dplyr::slice(1:4)
+
+### Plot DEG
+writexl::write_xlsx(deg.res.raw, paste0(prefix, ".Overall.DEG.raw.xlsx"))
+writexl::write_xlsx(deg.res, paste0(prefix, ".Overall.DEG.xlsx"))
+
+### run GOTF
+final.deg <- deg.res %>%
+  dplyr::select(Group, Gene) %>%
+  group_by(Group) %>% 
+  filter(n() > 5) %>%
+  ungroup() 
+
+### also run enrichR for significant genes
+go <- run_enrichR_groups(final.deg, dbs = "GO", prefix = paste0(prefix, ".Overall_DEG_GO"))
+tf <- run_enrichR_groups(final.deg, dbs = "TF", prefix = paste0(prefix, ".Overall_DEG_TF"), summary = TRUE)
+```
+
+
+
+### Overall DEG using lollipop to represent top enriched pathways
+```{r lollipop}
+dbs <- names(go$res[[1]])
+
+res <- go %>%
+  dplyr::select(-data) %>%
+  unnest(res) %>%
+  mutate(dbs = dbs) %>%
+  mutate(nrow = map_dbl(res, nrow)) %>%
+  filter(nrow > 2) %>%
+  unnest(res) %>%
+  mutate(Direction = gsub(".*_", "", Type)) %>%
+  mutate(Type = gsub("_[A-Z]+$", "", Type)) 
+
+cur.res <- res
+# Or we select top10 NES from our mouse
+top.n <- 10
+select.names <- res %>%
+  group_by(dbs, Type, Direction) %>%
+  arrange(desc(abs(Combined.Score))) %>%
+  dplyr::slice(1:top.n) %>%
+  ungroup() %>%
+  distinct(Type, dbs, Term, Direction, Combined.Score)
+  
+select.names.uniq <- res %>%
+  distinct(Type, Direction, Term, dbs, Combined.Score) %>%
+  left_join(dplyr::select(select.names, Type, Term, dbs), .) %>%
+  distinct() %>%
+  spread(Type, Combined.Score) %>% 
+  mutate(across(contains("_vs"), ~ replace_na(.x, 0))) %>%
+  arrange(dbs, UP)
+
+writexl::write_xlsx(list(select.names = select.names, select.names.uniq = select.names.uniq), "select.names.xlsx")
+
+
+### heatmap with overlap circle
+select.names.uniq <- select.names.uniq 
+
+
+p <- list()
+dbs.res <- list()
+
+for(cur.db in unique(cur.res$dbs)){
+  dbs.res[[cur.db]] <- cur.res %>% 
+    filter(dbs == cur.db) %>%
+    inner_join(distinct(select.names.uniq, dbs, Term), ., by = c("dbs", "Term")) %>%
+    # select the highest (unique) Combined.Score for every dbs + Term + Type
+    group_by(Term, Type) %>% 
+    arrange(desc(abs(Combined.Score))) %>%
+    dplyr::slice(1) %>%
+    ungroup() %>%
+    # Combined.Score is always greater than 0, convert < 1 into 1, so that log2 will be 0
+    # Adjust Combined.Score based on its Direction, convert DN into negative Combined.Score 
+    mutate(Combined.Score = ifelse(Combined.Score < 1, 1, Combined.Score)) %>%
+    mutate(Score = case_when(Direction == "UP" ~ log2(Combined.Score),
+                             Direction == "DN" ~ -log2(Combined.Score),
+                             TRUE ~ 0)) %>%
+    mutate(Score = ifelse(abs(Score) > 10, sign(Score) * 10, Score)) %>%
+    ungroup() %>%
+    # change here so that we know if it's UP or DN
+    mutate(Combined.Score = ifelse(Direction == "UP", Combined.Score, -Combined.Score)) %>% 
+    mutate(Term = gsub("\\(GO:.*", "", Term)) %>%
+    mutate(Type = gsub("_.*", "", Type)) %>%
+    arrange(Type, desc(Combined.Score)) %>% # sort Type
+    mutate(Term = factor(Term, levels=rev(unique(Term)))) %>%
+    mutate(`Adjusted.P.value` = case_when(`Adjusted.P.value` == 0 ~ 0.0001, TRUE ~ `Adjusted.P.value`)) %>%
+    dplyr::select(Term, Type, Score, Combined.Score, `Adjusted.P.value`, Direction) %>%
+    complete(Term, Type) %>% 
+    ungroup() 
+}
+
+### save for other plots
+writexl::write_xlsx(dbs.res, paste0(prefix, ".heatmap.res.xlsx"))
+
+
+### lollipop ### 
+ymax <- 12
+point.alpha <- 0.9
+
+library(ggnewscale)
+
+for(cur.dbs in names(dbs.res)){
+    top.term <- dbs.res[[cur.dbs]] %>%
+      mutate(Term = as.character(Term)) %>%
+      group_by(Term) %>%
+      arrange(desc(abs(Score))) %>%
+      dplyr::slice(1) %>%
+      ungroup() %>%
+      group_by(Type, Direction) %>%
+      arrange(Type, Direction, desc(abs(Score))) %>%
+      dplyr::slice(1:8) #%>%
+    
+      
+    p <- dbs.res[[cur.dbs]] %>%
+      filter(Term %in% top.term$Term) %>%
+      mutate(Term = substr(Term, 1, 38)) %>%
+      # for each Term, select higher Abs(Combined.Score)
+      group_by(Term) %>%
+      arrange(desc(abs(Combined.Score))) %>%
+      dplyr::slice(1) %>%
+      ungroup() %>%
+      arrange(Type, Score) %>%
+      mutate(Term = factor(Term, levels = unique(Term))) %>%
+      mutate(logP = -log10(Adjusted.P.value)) %>%
+      
+      ggplot(aes(x=Score, y=Term)) +
+      geom_segment(aes(x=0, xend=Score, y=Term, yend=Term), color="grey60") +
+      geom_point(aes(size = logP, color = abs(Score)), alpha = point.alpha) +
+      scale_size(range = c(5, 12)) + 
+      scale_colour_gradient2(
+        low = "green",
+        mid = "yellow",
+        high = "red",
+        midpoint = 5,
+        space = "Lab",
+        na.value = "grey50",
+        guide = "colourbar",
+        aesthetics = "colour"
+      ) +
+
+      theme_light() +
+      scale_x_continuous(limits = c(-ymax, ymax), breaks = seq(-ymax, ymax, 4)) +
+      geom_vline(xintercept = 0, linetype = "longdash") +
+      geom_hline(yintercept = 0, linetype = "longdash") +
+      # coord_flip() +
+      theme(
+        panel.border = element_blank(),
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        axis.title.x = element_text(size = 18),
+        axis.text.x = element_text(size = 14),
+        axis.text.y = element_text(size = 12),
+        axis.ticks.x = element_blank(),
+        axis.ticks.y = element_blank(),
+        plot.title = element_text(size = 20, face = "bold")
+      ) +
+      ggtitle(paste(cur.dbs, sep=":")) + 
+      xlab("log2(Combined Score, Directional)") +
+      ylab("") 
+    
+  pdf(paste(cur.dbs, "lollipop.pdf", sep="."), width = 9, height = 8)
+    print(p)
+  dev.off()
+}
+
+```
+
+
+
+
+
+
+
